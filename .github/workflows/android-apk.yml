@@ -1,0 +1,202 @@
+name: Android APK
+
+# Builds an installable OpenMinis APK on GitHub's runners, from a repository
+# that holds only the build recipe (this workflow + patches/) — the source
+# itself is fetched from upstream at a pinned commit.
+#
+# Why not vendor the source here: the tree is ~100 MB across 2 500 files, and
+# pushing that from a phone link fails on truncated packs. Upstream is cloned
+# on the runner (datacenter network, seconds) at a pinned SHA, so a build is
+# still fully reproducible.
+#
+# The app bundles a Linux sandbox, so the native dependencies are built from
+# source exactly as BUILDING.md prescribes: PRoot + its two ELF loaders
+# (deps/build_proot.sh), the Alpine rootfs
+# (scripts/prepare_android_sandbox.sh) and the rclone AAR
+# (deps/build_rclone_android.sh). Those dominate the first run (~30-45 min)
+# and are cached afterwards, keyed on the build scripts and the pinned SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: "Also build the minified release APK"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: https://github.com/OpenMinis/OpenMinis.git
+  # Upstream OpenMinis v1.14 (merge of PR #408). Bump deliberately; the build
+  # is reproducible only against a fixed SHA.
+  UPSTREAM_SHA: b4c0661d5631ebab4d1a2e6f3fd4c805d4030a6c
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: false
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages (NDK 28, CMake 3.22.1, API 36)
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # Resolve the newest available NDK 28.x rather than hard-coding a
+          # revision: build_proot.sh needs r28+, and the exact revision string
+          # in the SDK repo changes over time.
+          NDK_PKG=$(sdkmanager --list 2>/dev/null | tr -d ' ' | grep -E '^ndk;28\.' | sort -V | tail -1 | cut -d'|' -f1)
+          [ -n "$NDK_PKG" ] || { echo "no NDK 28.x in the SDK repo"; exit 1; }
+          echo "Resolved: $NDK_PKG"
+          sdkmanager --install "$NDK_PKG" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_PKG#ndk;}" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Fetch upstream source at ${{ env.UPSTREAM_SHA }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$UPSTREAM" upstream
+          if [ "$(git -C upstream rev-parse HEAD)" != "$UPSTREAM_SHA" ]; then
+            echo "pinned SHA is not the current tip — fetching it explicitly"
+            git -C upstream fetch --depth 1 origin "$UPSTREAM_SHA"
+            git -C upstream checkout -q FETCH_HEAD
+          fi
+          [ "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_SHA" ] || {
+            echo "checked out $(git -C upstream rev-parse HEAD), expected $UPSTREAM_SHA"; exit 1; }
+          git -C upstream submodule update --init --recursive --depth 1
+          echo "upstream @ $(git -C upstream rev-parse --short HEAD) ($(ls upstream/deps/proot | wc -l) files in deps/proot)"
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "no patches — building upstream as-is"
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "==> $p"
+            git -C upstream apply --verbose "$PWD/$p"
+          done
+
+      - name: Restore native dependencies
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstream/deps/build
+            upstream/src/android/app/libs
+            upstream/src/android/app/src/main/jniLibs
+            upstream/src/android/app/src/main/assets/proot-aarch64
+            upstream/src/android/app/src/main/assets/alpine-minirootfs.tar.gz
+          key: native-${{ runner.os }}-${{ env.UPSTREAM_SHA }}-${{ hashFiles('.github/workflows/android-apk.yml') }}-${{ hashFiles('patches/**') }}
+
+      - name: Build PRoot and its ELF loaders
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: ./deps/build_proot.sh
+        working-directory: upstream
+
+      - name: Fetch Alpine minirootfs
+        run: ./scripts/prepare_android_sandbox.sh
+        working-directory: upstream
+
+      - name: Build rclone AAR (gomobile)
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/
+
+      - name: Sanity-check sandbox assets
+        run: |
+          set -euo pipefail
+          # A missing loader yields an APK that installs fine and then fails on
+          # the first command ([Shell not running]) — see BUILDING.md. Fail
+          # here instead of shipping that.
+          for f in src/android/app/src/main/jniLibs/arm64-v8a/libproot.so \
+                   src/android/app/src/main/jniLibs/arm64-v8a/libproot-loader.so \
+                   src/android/app/src/main/jniLibs/arm64-v8a/libproot-loader32.so \
+                   src/android/app/src/main/assets/proot-aarch64 \
+                   src/android/app/src/main/assets/alpine-minirootfs.tar.gz \
+                   src/android/app/libs/rclone.aar; do
+            [ -f "upstream/$f" ] || { echo "missing: $f"; exit 1; }
+            printf '  %-58s %s\n' "$f" "$(du -h "upstream/$f" | cut -f1)"
+          done
+
+      - name: Restore Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('upstream/src/android/**/*.gradle.kts','upstream/src/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build debug APK
+        working-directory: upstream/src/android
+        run: |
+          set -euo pipefail
+          # The repo default is 2 GB; ChatViewModel.kt alone is ~17k lines and
+          # the Kotlin/KSP round trip does not fit in it.
+          printf '\norg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8\n' >> gradle.properties
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Build release APK
+        if: inputs.build_release
+        working-directory: upstream/src/android
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APKs
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find upstream/src/android/app/build/outputs/apk -name '*.apk' -exec cp {} out/ \;
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minis-apk-${{ github.run_number }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish a Release with the APK attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" out/*.apk \
+            --title "Minis APK ${GITHUB_RUN_NUMBER}" \
+            --notes "Upstream OpenMinis @ ${UPSTREAM_SHA:0:7} + $(ls patches 2>/dev/null | wc -l) patch(es), built by run ${GITHUB_RUN_NUMBER}.
+
+          Debug APK, signed with the standard Android debug key (the project's
+          release config uses the same key — see BUILDING.md), so it installs
+          over a previous build from this repo. Only arm64-v8a is packaged."
