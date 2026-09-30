@@ -147,7 +147,7 @@ jobs:
             upstream/src/android/app/src/main/jniLibs
             upstream/src/android/app/src/main/assets/proot-aarch64
             upstream/src/android/app/src/main/assets/alpine-minirootfs.tar.gz
-          key: native-${{ runner.os }}-${{ env.UPSTREAM_SHA }}-${{ hashFiles('.github/workflows/android-apk.yml') }}-${{ hashFiles('patches/**') }}
+          key: native-${{ runner.os }}-${{ env.UPSTREAM_SHA }}-${{ hashFiles('patches/**') }}
 
       - name: Build PRoot and its ELF loaders
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -227,11 +227,13 @@ jobs:
           # instead of publishing an APK the user cannot install over the
           # previous one.
           APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
-          EXPECT="8A:A1:78:4D:87:AA:1D:EC:CD:EC:EA:06:A0:19:45:85:6D:65:3E:A5:09:FC:0F:F0:4D:BF:3E:BB:62:ED:E7:BE"
+          # apksigner prints "V2 Signer: certificate SHA-256 digest: <hex>" —
+          # two colons, lowercase hex, no separators. Take the LAST field.
+          EXPECT="8aa1784d87aa1deccdecea06a01945856d653ea509fc0ff04dbf3ebb62ede7be"
           for apk in out/*.apk; do
             echo "== $apk"
-            "$APKSIGNER" verify --print-certs "$apk" | grep -i "SHA-256 digest" || true
-            got="$("$APKSIGNER" verify --print-certs "$apk" | awk -F': ' '/certificate SHA-256 digest/ {print $2; exit}')"
+            "$APKSIGNER" verify --print-certs "$apk" | grep -i "digest" || true
+            got="$("$APKSIGNER" verify --print-certs "$apk" | awk -F': ' '/certificate SHA-256 digest/ {print tolower($NF); exit}')"
             [ "$got" = "$EXPECT" ] || { echo "signer mismatch in $apk"; echo "  got      $got"; echo "  expected $EXPECT"; exit 1; }
           done
           echo "All APKs signed with the pinned key."
