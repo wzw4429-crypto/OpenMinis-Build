@@ -127,6 +127,16 @@ jobs:
             git -C upstream apply --verbose "$PWD/$p"
           done
 
+      - name: Install the pinned signing key
+        run: |
+          set -euo pipefail
+          # All build types sign with this key (patches/0001), so consecutive
+          # builds upgrade each other instead of colliding on a fresh
+          # per-runner debug keystore.
+          mkdir -p upstream/src/android/ci-signing
+          cp keystore/minis-build.p12 upstream/src/android/ci-signing/minis-build.p12
+          ls -l upstream/src/android/ci-signing/
+
       - name: Restore native dependencies
         id: native-cache
         uses: actions/cache@v4
@@ -208,6 +218,23 @@ jobs:
           mkdir -p out
           find upstream/src/android/app/build/outputs/apk -name '*.apk' -exec cp {} out/ \;
           ls -lh out/
+
+      - name: Assert every APK carries the pinned signer
+        run: |
+          set -euo pipefail
+          # Stops the "signature differs" class of bug at the source: if the
+          # patch or the keystore stops being applied, the build fails here
+          # instead of publishing an APK the user cannot install over the
+          # previous one.
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          EXPECT="8A:A1:78:4D:87:AA:1D:EC:CD:EC:EA:06:A0:19:45:85:6D:65:3E:A5:09:FC:0F:F0:4D:BF:3E:BB:62:ED:E7:BE"
+          for apk in out/*.apk; do
+            echo "== $apk"
+            "$APKSIGNER" verify --print-certs "$apk" | grep -i "SHA-256 digest" || true
+            got="$("$APKSIGNER" verify --print-certs "$apk" | awk -F': ' '/certificate SHA-256 digest/ {print $2; exit}')"
+            [ "$got" = "$EXPECT" ] || { echo "signer mismatch in $apk"; echo "  got      $got"; echo "  expected $EXPECT"; exit 1; }
+          done
+          echo "All APKs signed with the pinned key."
 
       - uses: actions/upload-artifact@v4
         with:

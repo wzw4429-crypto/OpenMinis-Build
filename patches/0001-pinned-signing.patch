@@ -1,0 +1,30 @@
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 50369d8..8f5856d 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -32,6 +32,25 @@ android {
+     // Build.VERSION.SDK_INT >= 36 (see DynamicIslandSupport / AgentForegroundService).
+     compileSdk = 36
+ 
++    // [local build] Pin the signing key. All three build types (debug, perf,
++    // release) use the `debug` signing config, whose keystore is otherwise
++    // generated per machine — and, in CI, per runner, so every build came out
++    // with a different signer and could not upgrade the previous one ("App not
++    // installed"). The key lives in ci-signing/ (copied in by the workflow)
++    // and is a throwaway self-signed key for local builds only.
++    signingConfigs {
++        getByName("debug") {
++            val ks = rootProject.file("ci-signing/minis-build.p12")
++            if (ks.exists()) {
++                storeFile = ks
++                storeType = "PKCS12"
++                storePassword = System.getenv("MINIS_KEYSTORE_PASSWORD") ?: "minisbuild"
++                keyAlias = System.getenv("MINIS_KEY_ALIAS") ?: "minisbuild"
++                keyPassword = System.getenv("MINIS_KEY_PASSWORD") ?: "minisbuild"
++            }
++        }
++    }
++
+     defaultConfig {
+         applicationId = "com.openminis.app"
+         minSdk = 26

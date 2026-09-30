@@ -43,6 +43,27 @@ runs skip the heavy steps (Gradle is cached separately).
 installs and then fails every shell command with `[Shell not running]`, so the
 workflow asserts they exist *before* Gradle runs.
 
+## Signing
+
+Every build is signed with the **same key**, `keystore/minis-build.p12`
+(throwaway self-signed, CN=OpenMinis local build, valid to 2056,
+`patches/0001-pinned-signing.patch` makes Gradle use it):
+
+```
+SHA-256  8A:A1:78:4D:87:AA:1D:EC:CD:EC:EA:06:A0:19:45:85:6D:65:3E:A5:09:FC:0F:F0:4D:BF:3E:BB:62:ED:E7:BE
+```
+
+That matters because Android refuses to install an APK whose signer differs
+from the installed one ("App not installed"). The default debug keystore is
+generated per machine — and per CI runner — so leaving it in place made every
+build a *different* app: nothing could be updated in place, ever. The workflow
+now asserts the signer fingerprint on each APK before publishing.
+
+**The official build is signed with the developer's key**, so moving from the
+store version to this one requires uninstalling it once (and exporting its data
+first — see upstream's backup/restore). After that, builds from here install
+over each other normally.
+
 ## Changing the app
 
 1. Add a `.patch` under `patches/` (e.g. `git -C <upstream clone> diff > 0001-thing.patch`).
