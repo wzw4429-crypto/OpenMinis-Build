@@ -57,21 +57,36 @@ jobs:
           go-version: "1.25.x"
           cache: false
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages (NDK 28, CMake 3.22.1, API 36)
+      - name: Locate the preinstalled Android SDK and install packages
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # ubuntu-latest already ships the SDK. android-actions/setup-android
+          # dies here (sdkmanager --licenses, interactive), so drive sdkmanager
+          # directly and pin the SDK/env vars ourselves.
+          SDK=""
+          for d in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk "$HOME/Android/Sdk"; do
+            if [ -n "$d" ] && [ -d "$d/cmdline-tools" ]; then SDK="$d"; break; fi
+          done
+          [ -n "$SDK" ] || { echo "no Android SDK with cmdline-tools on this runner"; exit 1; }
+          TOOLS="$(find "$SDK/cmdline-tools" -maxdepth 2 -type d -name bin | head -1)"
+          echo "SDK=$SDK  cmdline-tools=$TOOLS"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$TOOLS" >> "$GITHUB_PATH"
+          export PATH="$TOOLS:$PATH"
+
+          timeout 300 sh -c 'yes | sdkmanager --licenses' > /dev/null 2>&1 || true
+          sdkmanager --version
+
           # Resolve the newest available NDK 28.x rather than hard-coding a
           # revision: build_proot.sh needs r28+, and the exact revision string
           # in the SDK repo changes over time.
           NDK_PKG=$(sdkmanager --list 2>/dev/null | tr -d ' ' | grep -E '^ndk;28\.' | sort -V | tail -1 | cut -d'|' -f1)
           [ -n "$NDK_PKG" ] || { echo "no NDK 28.x in the SDK repo"; exit 1; }
           echo "Resolved: $NDK_PKG"
-          sdkmanager --install "$NDK_PKG" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_PKG#ndk;}" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          yes | sdkmanager --install "$NDK_PKG" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_PKG#ndk;}" >> "$GITHUB_ENV"
+          ls "$SDK/ndk" "$SDK/cmake" 2>/dev/null || true
 
       - name: Fetch upstream source at ${{ env.UPSTREAM_SHA }}
         run: |
