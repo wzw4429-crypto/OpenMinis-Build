@@ -84,9 +84,20 @@ jobs:
           NDK_PKG=$(sdkmanager --list 2>/dev/null | tr -d ' ' | grep -E '^ndk;28\.' | sort -V | tail -1 | cut -d'|' -f1)
           [ -n "$NDK_PKG" ] || { echo "no NDK 28.x in the SDK repo"; exit 1; }
           echo "Resolved: $NDK_PKG"
+          # `yes` also feeds the licence prompt; when sdkmanager finishes early
+          # it dies with EPIPE ("Broken pipe", exit 1), which pipefail would
+          # report as a step failure. Only sdkmanager's own status matters.
+          set +e
           yes | sdkmanager --install "$NDK_PKG" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
+          rc=${PIPESTATUS[1]}
+          set -e
+          [ "$rc" = 0 ] || { echo "sdkmanager --install failed (exit $rc)"; exit 1; }
           echo "ANDROID_NDK_HOME=$SDK/ndk/${NDK_PKG#ndk;}" >> "$GITHUB_ENV"
           ls "$SDK/ndk" "$SDK/cmake" 2>/dev/null || true
+          for p in "$SDK/ndk/${NDK_PKG#ndk;}" "$SDK/cmake/3.22.1" "$SDK/platforms/android-36"; do
+            [ -d "$p" ] || { echo "sdkmanager did not install $p"; exit 1; }
+          done
+          echo "SDK packages in place."
 
       - name: Fetch upstream source at ${{ env.UPSTREAM_SHA }}
         run: |
@@ -181,7 +192,10 @@ jobs:
           # The repo default is 2 GB; ChatViewModel.kt alone is ~17k lines and
           # the Kotlin/KSP round trip does not fit in it.
           printf '\norg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8\n' >> gradle.properties
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace || {
+            echo "::warning::first Gradle attempt failed — retrying once (remote dependency fetch can flake)"
+            ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          }
 
       - name: Build release APK
         if: inputs.build_release
